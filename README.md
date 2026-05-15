@@ -151,6 +151,118 @@ watch -n 5 cat work/afl-out/fuzzer_stats
 
 跑完后 `afl-plot work/afl-out work/afl-plot/` 可生成覆盖率趋势图供报告截图。
 
+### 3.5 三脚本截图模式（推荐用于交作业）
+
+作业报告需要三类截图：**手写 driver、12 h fuzz、静态分析**。为方便逐项截屏，
+仓库另提供三个独立脚本（位于 `scripts/`），分别对应一个阶段。每个脚本在终端
+里直接渲染本阶段产物，**结束后停在该窗口不退出**，按 `Ctrl+C` 才返回 shell —
+可以从容地按 PrtSc / 截图工具截屏。
+
+| 脚本 | 对应 Python 入口 | 默认 target | 关键参数 | 截屏什么 |
+|------|------------------|-------------|----------|---------|
+| `scripts/run_static.sh` | `agent/run_static.py` | `curl` | — | clang 版本面板 + 全部 warning 表格 |
+| `scripts/run_dynamic.sh` | `agent/run_dynamic.py` | `curl` | `[fuzz_seconds]`，默认 `43200`（12 h） | ① 手写 driver 高亮源码（启动时）<br>② AFL TUI（运行中，自动占据整屏）<br>③ `fuzzer_stats` 表格 + `afl-plot` PNG 路径（结束后） |
+| `scripts/run_synthesize.sh` | `agent/run_synthesize.py` | `curl` | — | LLM 诊断 + Markdown / JSON 报告路径 |
+
+> 三个脚本都共享同一个 `work/` 目录；只要某阶段已经跑过，下次再跑会复用其
+> 产物（plan / 插桩库 / harness 等）。先 `run_static.sh`、再 `run_dynamic.sh`
+> （12 h）、最后 `run_synthesize.sh` 是推荐顺序。
+
+#### 3.5.1 完整三步示例
+
+```bash
+cd software_measure
+source venv/bin/activate
+
+# ① 静态分析 — 跑完后停在告警表格，截图后 Ctrl+C
+bash scripts/run_static.sh curl
+
+# ② 12 h 动态 fuzz — 先按 ENTER 启动 AFL TUI；
+#    12 h 到时自动退出 TUI、显示 fuzzer_stats + afl-plot 图片路径，
+#    脚本不退出，等你截完图按 Ctrl+C
+bash scripts/run_dynamic.sh curl 43200
+
+# ③ 综合（LLM 诊断 + 生成报告）— 不需要截图，但产物用于报告正文
+bash scripts/run_synthesize.sh curl
+```
+
+每个脚本第一行都会自动 `source venv/bin/activate`，所以无论当前 shell 是不是
+已激活 venv 都能直接跑。
+
+#### 3.5.2 怎么"画"手写 driver（截图项 1）
+
+"手写 driver" 在本项目中 = `work/harness/harness.c`（由 HarnessAgent 让 LLM 生
+成的 fuzz harness）。`run_dynamic.sh` 在启动 AFL 之前会用 Rich 在终端打印一
+个带行号、彩色高亮、Monokai 主题的面板：
+
+```
+╭────────────── fuzz driver — work/harness/harness.c ──────────────╮
+│  1  #include <stdio.h>                                            │
+│  2  #include <stdlib.h>                                           │
+│  3  #include <curl/curl.h>                                        │
+│  …                                                                │
+╰───────────────────────────────────────────────────────────────────╯
+```
+
+这一屏出现时就直接截图。如果只想看 driver、不跑 fuzz，可以单独打开它：
+
+```bash
+# 终端里彩色高亮预览（同 run_dynamic.sh 用的渲染）
+source venv/bin/activate
+python -c "
+from rich.console import Console
+from rich.panel import Panel
+from rich.syntax import Syntax
+p='work/harness/harness.c'
+Console().print(Panel(Syntax(open(p).read(),'c',line_numbers=True,theme='monokai'),
+                      title=p, border_style='cyan'))
+"
+
+# 或直接用 bat（如装了）
+bat work/harness/harness.c
+```
+
+> 若 `work/harness/harness.c` 还不存在，先跑一次 `python main.py --mode harness
+> --target curl` 或 `bash scripts/run_dynamic.sh curl 60`（短 fuzz 即可生成）。
+
+#### 3.5.3 怎么导出 afl-plot 图片（截图项 2）
+
+`run_dynamic.sh` 结束时自动调用 `afl-plot work/afl-out work/afl-plot/`，PNG
+落到 `work/afl-plot/`（典型有 `high_freq.png`、`low_freq.png`、`exec_speed.png`）。
+
+- 终端内联预览：若已 `apt install chafa`，脚本会用 chafa 把 PNG 渲染到终端
+  里，可直接截图；否则只打印路径，请用任意图片查看器打开 PNG 截屏。
+- 跨多个项目复用：把 `work/afl-plot/*.png` 拷到 `report/img/<target>/`，再在
+  `report/<target>_report.md` 里 `![cov](img/<target>/high_freq.png)` 引用。
+
+#### 3.5.4 跑其他被测库
+
+⚠️ 当前 `agent/config.py` 把所有产物写到同一个 `work/`。**切换 target 之前
+务必把上一次的 `work/` 备份**，否则 harness / afl-out / 报告会被覆盖：
+
+```bash
+# 假设已按 §9 把 libpcap / libvpx 加进 agent/config.py::TARGETS
+
+# 跑 curl，跑完后归档
+bash scripts/run_dynamic.sh curl 43200
+mv work work-curl
+
+# 跑 libpcap，新建 work/
+bash scripts/run_static.sh   libpcap
+bash scripts/run_dynamic.sh  libpcap 43200
+mv work work-libpcap
+
+# 同理 libvpx
+bash scripts/run_dynamic.sh  libvpx 43200
+mv work work-libvpx
+
+# 写报告时统一从 work-<target>/ 取 PNG + harness.c + report.md
+```
+
+或者每次跑前 `--workdir work-<target>` 也行（同 `main.py` 接受该参数；脚本未
+透传，需要直接调 `python -m agent.run_dynamic --target libpcap --workdir
+work-libpcap --fuzz-seconds 43200`）。
+
 ---
 
 ## 4. CLI 参数完整列表
