@@ -228,12 +228,22 @@ bat work/harness/harness.c
 #### 3.5.3 怎么导出 afl-plot 图片（截图项 2）
 
 `run_dynamic.sh` 结束时自动调用 `afl-plot work/afl-out work/afl-plot/`，PNG
-落到 `work/afl-plot/`（典型有 `high_freq.png`、`low_freq.png`、`exec_speed.png`）。
+落到 `work/afl-plot/`：
 
-- 终端内联预览：若已 `apt install chafa`，脚本会用 chafa 把 PNG 渲染到终端
-  里，可直接截图；否则只打印路径，请用任意图片查看器打开 PNG 截屏。
-- 跨多个项目复用：把 `work/afl-plot/*.png` 拷到 `report/img/<target>/`，再在
-  `report/<target>_report.md` 里 `![cov](img/<target>/high_freq.png)` 引用。
+- `high_freq.png` — paths_total / pending_total 趋势（1000×300）
+- `low_freq.png` — unique_crashes / unique_hangs 趋势（1000×200）
+- `exec_speed.png` — execs/sec 趋势（1000×200）
+- `index.html` — 把三张图嵌好的汇总页
+
+脚本不会在终端里渲染图片，只打印 PNG 的绝对路径 —— 用 VSCode / 浏览器 /
+任何图片查看器打开 PNG 截屏即可。前置依赖只有一个：
+
+```bash
+sudo apt install -y gnuplot-nox   # afl-plot 依赖；不装则 _try_afl_plot 静默跳过
+```
+
+跨多个项目复用：把 `work/afl-plot/*.png` 拷到 `report/img/<target>/`，再在
+`report/<target>_report.md` 里 `![cov](img/<target>/high_freq.png)` 引用。
 
 #### 3.5.4 跑其他被测库
 
