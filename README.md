@@ -348,6 +348,175 @@ python main.py [--target TARGET] [--mode MODE] [--api HINT]
 - LLM 输入只携带必要片段（头文件、warning 段落、crash hexdump），单次调用平均 ≈ 1 k tokens。
 - Diagnostic 与 Planner 使用 `response_format=json_object`，保证产物机器可读。
 
+### 5.1 设计思路
+
+本项目的核心论点是：**"挖漏洞"这件事可以被拆成一组"LLM 推理 + 确定性工具"的小步骤**，
+而不是让 LLM 端到端"看代码找 bug"。LLM 擅长的是「在大量自然语言 / 代码片段中做归类、
+选择和模板填空」，而 AFL / Clang Static Analyzer 等成熟工具擅长的是「机械地、可重复地
+执行漏洞挖掘动作」。两者各取所长：
+
+| 职责 | 由谁完成 | 为什么 |
+|---|---|---|
+| 选 fuzz 入口 API、决定要分析哪个文件 | **LLM**（Planner） | 需要读 README 自然语言、按头文件签名做语义判断 |
+| 写出能编译过、能触发解析逻辑的 harness.c | **LLM**（Harness） | 是高度模板化的代码生成任务，但 API 形参组合多 |
+| 真正去执行覆盖率引导的输入变异 | **AFL**（工具） | 这是确定性的、需要十亿级 execs 的工程任务，LLM 无法替代 |
+| 真正去做路径敏感的污点 / 死代码分析 | **Clang Static Analyzer**（工具） | 同上，需要编译器前端能力 |
+| 把上千条工具告警 / crash 归类、判严重性、写人话 | **LLM**（Diagnostic + Reporter） | 工具只输出位置和类别码，缺少业务语义和优先级判断 |
+
+由此得出一条原则：**LLM 不进入热循环**。Agent 在流水线上只出现 4 次（Plan / Harness /
+Diagnose / Report），其余时间都是工具在跑。这样 12 h fuzz 的 LLM 成本 < 10 万 tokens。
+
+### 5.2 各 Agent 详解
+
+#### 5.2.1 PlannerAgent — [agent/agents/planner.py](agent/agents/planner.py)
+
+- **输入**：被测库的 `README.md` 头部 + 主要公共头文件（`curl/include/curl/*.h`）的摘录。
+- **工具**：`agent/tools/parser.py` 负责截取头文件签名；不调用编译器。
+- **LLM**：`gpt-4.1-mini`，`response_format=json_object`，提示词在 [agent/prompts/planner.md](agent/prompts/planner.md)。
+- **输出**：`work/plan.json`，结构
+
+  ```json
+  {
+    "target_file":        "lib/urlapi.c",
+    "target_api":         "curl_url_set",
+    "seed_strategy":      "url",
+    "static_focus_files": ["lib/urlapi.c", "lib/escape.c", "lib/hostip.c"]
+  }
+  ```
+- **作用**：把后续静态 / 动态分析从"对全工程开炮"收敛到"针对最值得攻击的入口"，
+  显著缩小搜索空间并让 12 h 预算花在刀刃上。
+
+#### 5.2.2 StaticAgent — [agent/agents/static_agent.py](agent/agents/static_agent.py)
+
+- **输入**：Planner 输出的 `static_focus_files`，被测库源码。
+- **工具**：
+  - `agent/tools/clang_sa.py::run_focused_clang_analyze()` — 对 3 个 planner
+    选中的 `.c` 调 `clang --analyze -Xanalyzer -analyzer-output=html`，30 s 级。
+  - `agent/tools/clang_sa.py::run_scan_build()` — 可选的 `scan-build make -j2`
+    全工程扫描，30–60 min（受 `AGENT_SKIP_SCAN_BUILD=1` 控制）。
+- **LLM**：**不调用**。它是一个纯工具调度 Agent。
+- **输出**：`work/static_findings.json` + `work/scan-build-reports/**/*.html`。
+- **作用**：在动态测试还没起跑前，就把可被静态规则发现的 NULL deref / 未初始化
+  内存 / 死代码先扫一遍，作为 fuzz 的"对照组"。
+
+#### 5.2.3 HarnessAgent — [agent/agents/harness_agent.py](agent/agents/harness_agent.py)
+
+- **输入**：`target_api` 名称 + 对应头文件签名 + Planner 给的 `seed_strategy`。
+- **工具**：
+  - `agent/tools/shell.py::run()` 调 `afl-gcc` 编译 harness 并链接 `libcurl.a`。
+  - 若链接失败（缺 `-lz`、`-lssl` 等），回退到 dry-run 错误信息让 LLM 重试。
+- **LLM**：`gpt-4.1-mini`，提示词 [agent/prompts/harness.md](agent/prompts/harness.md)，
+  要求生成单文件 C，**避免** `__AFL_LOOP`（AFL 2.52b 的 afl-gcc 不支持 persistent mode）。
+- **输出**：`work/harness/harness.c`（"手写 driver"）+ `work/harness/harness_afl`（插桩二进制）。
+- **作用**：自动消除"为每个新库人工写一份 harness.c"的体力活；Planner + Harness
+  的组合让新增 target 只需要在 `agent/config.py::TARGETS` 加一条目即可。
+
+#### 5.2.4 DynamicAgent — [agent/agents/dynamic_agent.py](agent/agents/dynamic_agent.py)
+
+- **输入**：`harness_afl` + 由 [agent/tools/seeds.py](agent/tools/seeds.py) 按 `seed_strategy` 准备的种子语料。
+- **工具**：`agent/tools/afl.py` 封装
+  - `afl-fuzz -i seeds -o afl-out -t 5000 -m none -- harness_afl @@`
+  - 12 h 墙钟由 `subprocess.run(timeout=...)` 控制。
+  - `afl-plot` 在结束后生成 `high_freq.png` / `low_freq.png` / `exec_speed.png`。
+- **LLM**：**不调用**。Agent 只做参数装配、超时控制、产物解析。
+- **输出**：`work/afl-out/{queue,crashes,hangs,fuzzer_stats,plot_data}` +
+  `work/dynamic_findings.json`（已对 unique crash 去重）+ `work/afl-plot/*.png`。
+- **作用**：把 AFL 包装成一个"可被流水线调度的步骤"，同时为后续 Diagnostic 提
+  供结构化输入（crash 的 hexdump、execs/sec、唯一 crash 数）。
+
+#### 5.2.5 DiagnosticAgent — [agent/agents/diagnostic_agent.py](agent/agents/diagnostic_agent.py)
+
+- **输入**：
+  - 静态告警列表（每条带 `file:line + category + 上下文 3 行`）。
+  - 动态 crash 列表（每条带 16 字节 hexdump + 触发的 API 调用）。
+  - `harness.c` 全文（让 LLM 知道是被怎么调进去的）。
+- **工具**：无外部工具调用；纯 LLM 归类。
+- **LLM**：对每条 finding **独立**调用一次 `gpt-4.1-mini`，
+  `response_format=json_object`，提示词分两份：
+  [agent/prompts/static_diagnosis.md](agent/prompts/static_diagnosis.md) /
+  [agent/prompts/dynamic_diagnosis.md](agent/prompts/dynamic_diagnosis.md)。
+  调用并行度由 `agent/llm.py` 的 `tenacity` 退避控制，5xx 自动重试。
+- **输出**：`work/diagnoses.json`，每条形如
+
+  ```json
+  {
+    "finding_id":   "static#7",
+    "category":     "NULL pointer dereference",
+    "severity":     "medium",
+    "root_cause":   "Hostname 解析失败时 hostp 仍被 strcpy",
+    "fix":          "在 Curl_str_until 之后判 NULL 再 memcpy",
+    "confidence":   0.78
+  }
+  ```
+- **作用**：把工具的"干警告"翻译成人能直接做优先级排序的"漏洞条目"。
+  这一步是整个流水线唯一一处"LLM 在做判断"，其他三处都是"LLM 在做模板填空"。
+
+#### 5.2.6 ReporterAgent — [agent/agents/reporter.py](agent/agents/reporter.py)
+
+- **输入**：Plan + 静态 findings + 动态 findings + 全部 diagnoses。
+- **工具**：无；纯 LLM 文本生成。
+- **LLM**：`gpt-4.1-mini`，提示词 [agent/prompts/report.md](agent/prompts/report.md)，
+  这次**不**用 JSON 模式 —— 输出直接是 Markdown。
+- **输出**：`work/report.md`（人读，2–4 KB）+ `work/report.json`（机读，含原始 findings）。
+- **作用**：把多源结果合成一份可交作业的报告样例；与 `report/curl_report.md` 风格一致。
+
+### 5.3 LLM 调用约定（全部走 [agent/llm.py](agent/llm.py)）
+
+| 维度 | 设定 | 理由 |
+|---|---|---|
+| 模型 | `gpt-4.1-mini`（可由 `OPENAI_MODEL` 覆盖） | 价格 / 上下文 / JSON mode 兼容性的平衡点 |
+| 温度 | `0`（Planner / Diagnostic）/ `0.3`（Harness / Reporter） | 判断类要稳定；生成类留一点变化 |
+| 输出格式 | Planner / Diagnostic → `response_format=json_object`<br>Harness / Reporter → 自由文本（C 源码 / Markdown） | 下游需要解析 vs. 需要可读性 |
+| 重试 | `tenacity` 指数回退，最多 5 次，仅对 5xx / 超时 | 容忍代理偶发抖动，不掩盖 4xx 配置错误 |
+| 上下文 | 每次调用 ≤ 4 k tokens，平均 ≈ 1 k | LLM 不进入热循环，单次跑全流水线总 token < 10 万 |
+
+### 5.4 与动态 / 静态工具的结合方式
+
+```
+                ┌──── plan.json ─────┐
+   PlannerAgent ┤                    ├── 选 target_file & static_focus_files
+                └────────────────────┘
+                          │
+        ┌─────────────────┴─────────────────┐
+        ▼                                   ▼
+ StaticAgent ──► clang --analyze       HarnessAgent ──► afl-gcc harness.c
+                scan-build make                          → harness_afl
+        │                                   │
+        ▼                                   ▼
+ static_findings.json               DynamicAgent ──► afl-fuzz 12 h
+                                                    afl-plot → PNG
+        │                                   │
+        └──────────────► DiagnosticAgent ◄──┘   # 同时吃静态 + 动态结果
+                          │
+                          ▼
+                   ReporterAgent ──► report.md / report.json
+```
+
+关键耦合点：
+
+1. **Planner → Static**：Planner 给 `static_focus_files`，Static 只跑这几个文件，
+   避免 30–60 min 的全工程扫描。可以理解为「让 LLM 给 Clang 圈重点」。
+2. **Planner → Harness**：Planner 给 `target_api` 和 `seed_strategy`，Harness 知道
+   要 fuzz `curl_url_set`，要喂 URL 字符串。即「让 LLM 给 AFL 选靶子和饵料」。
+3. **AFL plot_data → afl-plot → PNG**：Dynamic 跑完后才有 `plot_data` CSV，调
+   `afl-plot` 生成 3 张趋势图作为报告截图素材。
+4. **Static + Dynamic → Diagnostic**：两路结果合并送进同一个 Diagnostic，让 LLM
+   有可能识别出"静态报的 NULL deref 和动态 crash 是同一根因"。
+5. **断点续跑**：每个 stage 写 `work/.<stage>.done`，下次重跑会跳过；删掉对应标记即可单独重跑某个 Agent。
+
+### 5.5 任务分解方式（为什么这样切）
+
+- **以"工具输入 / 输出"作为切分边界**：切分点都落在持久化文件上
+  （`plan.json` / `harness_afl` / `*.json`），方便单独重跑、单独截图、单独调试。
+- **LLM 步骤要么"挑选"要么"归类"，不让 LLM 直接看 12 h 的原始 fuzz 输出**：
+  Diagnostic 拿到的是已经被 `agent/tools/afl.py::collect_crashes(limit=20)` 截断、
+  去重过的 hexdump，LLM 无须处理 GB 级数据。
+- **同一类 finding 调用粒度细到每条**：Diagnostic 对每条 finding 单独问 LLM，
+  好处是 prompt 简短、可并行；代价是 N 次小调用，但每次 < 1 k tokens 远比一次
+  20 k tokens 的大批量更稳。
+- **Reporter 是"汇总"而不是"再分析"**：所有判断在 Diagnostic 阶段就结束；
+  Reporter 只是把 JSON 重新组织成 Markdown，避免再次推理引入不一致结论。
+
 ---
 
 ## 6. 产物结构

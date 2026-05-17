@@ -18,14 +18,16 @@ class ReporterAgent:
 
     def run(self, plan: dict, static_findings: list[dict],
             dynamic_findings: dict, diagnoses: dict) -> dict:
+        stats = dynamic_findings.get("stats", {})
         summary = {
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "target": self.cfg.target.name,
             "fuzz_seconds": self.cfg.fuzz_seconds,
+            "actual_fuzz_seconds": _actual_fuzz_seconds(stats),
             "plan": plan,
             "static_count": len(static_findings),
             "static_findings": static_findings,
-            "dynamic_stats": dynamic_findings.get("stats", {}),
+            "dynamic_stats": stats,
             "dynamic_crashes": dynamic_findings.get("crashes", []),
             "prereq_warnings": dynamic_findings.get("prereq_warnings", []),
             "diagnoses": diagnoses,
@@ -56,7 +58,16 @@ class ReporterAgent:
         lines.append(f"# software_measure report — {s['target']}")
         lines.append("")
         lines.append(f"- generated: `{s['generated_at']}`")
-        lines.append(f"- fuzz duration: `{s['fuzz_seconds']}s`")
+        actual = s.get("actual_fuzz_seconds")
+        if actual:
+            lines.append(
+                f"- fuzz duration: `{actual}s` ({actual / 3600:.2f}h)"
+            )
+        else:
+            lines.append(
+                f"- fuzz duration: `{s['fuzz_seconds']}s` "
+                f"(budget; no stats available)"
+            )
         lines.append(f"- planner target: `{plan.get('target_api')}` "
                      f"in `{plan.get('target_file')}`")
         lines.append("")
@@ -75,8 +86,11 @@ class ReporterAgent:
         lines.append("## 动态测试（AFL）")
         stats = s.get("dynamic_stats", {})
         lines.append(f"- execs done: `{stats.get('execs_done', '?')}`")
-        lines.append(f"- unique crashes: `{stats.get('unique_crashes', '?')}`")
+        lines.append(f"- execs/sec: `{stats.get('execs_per_sec', '?')}`")
         lines.append(f"- paths total: `{stats.get('paths_total', '?')}`")
+        lines.append(f"- bitmap coverage: `{stats.get('bitmap_cvg', '?')}`")
+        lines.append(f"- unique crashes: `{stats.get('unique_crashes', '?')}`")
+        lines.append(f"- unique hangs: `{stats.get('unique_hangs', '?')}`")
         lines.append(f"- collected crash samples: `{len(s.get('dynamic_crashes', []))}`")
         lines.append("")
         for entry in s.get("diagnoses", {}).get("dynamic", [])[:20]:
@@ -98,7 +112,8 @@ def _compact(s: dict) -> dict:
     """Strip large/irrelevant fields before sending to the LLM."""
     return {
         "target": s["target"],
-        "fuzz_seconds": s["fuzz_seconds"],
+        "fuzz_seconds_budget": s["fuzz_seconds"],
+        "fuzz_seconds_actual": s.get("actual_fuzz_seconds"),
         "static_count": s["static_count"],
         "top_static": [
             {"file": e["finding"].get("file"), "line": e["finding"].get("line"),
@@ -116,3 +131,13 @@ def _compact(s: dict) -> dict:
             for e in s.get("diagnoses", {}).get("dynamic", [])[:20]
         ],
     }
+
+
+def _actual_fuzz_seconds(stats: dict) -> int | None:
+    """Derive the real wall-clock fuzz duration from fuzzer_stats timestamps."""
+    try:
+        start = int(stats["start_time"])
+        end = int(stats["last_update"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return max(0, end - start)
